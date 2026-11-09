@@ -278,6 +278,62 @@ static const EFI_GUID EFI_LOADED_IMAGE_PROTOCOL_GUID = {
     {0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b}
 };
 
+/* --- Simple File System (ESP trace logging, booter hard-hang diagnosis) ---
+ * Minimal EFI 2.x FILE / SIMPLE_FILE_SYSTEM protocols. Only the fields up to
+ * Flush are declared; they sit at the same offsets in FILE_REVISION 1 and 2,
+ * so calling Open/Close/Write/Flush by pointer is layout-correct. */
+#define EFI_FILE_MODE_READ   0x0000000000000001ULL
+#define EFI_FILE_MODE_WRITE  0x0000000000000002ULL
+#define EFI_FILE_MODE_CREATE 0x8000000000000000ULL
+#define EFI_FILE_DIRECTORY   0x0000000000000010ULL
+#define EFI_FILE_ARCHIVE     0x0000000000000020ULL
+
+typedef struct efi_file EFI_FILE;
+
+typedef EFI_STATUS (EFIAPI *EFI_FILE_OPEN)(
+    EFI_FILE *This, EFI_FILE **NewHandle, CHAR16 *FileName,
+    UINT64 OpenMode, UINT64 Attributes);
+typedef EFI_STATUS (EFIAPI *EFI_FILE_CLOSE)(EFI_FILE *This);
+typedef EFI_STATUS (EFIAPI *EFI_FILE_DELETE)(EFI_FILE *This);
+typedef EFI_STATUS (EFIAPI *EFI_FILE_READ)(
+    EFI_FILE *This, UINTN *BufferSize, void *Buffer);
+typedef EFI_STATUS (EFIAPI *EFI_FILE_WRITE)(
+    EFI_FILE *This, UINTN *BufferSize, const void *Buffer);
+typedef EFI_STATUS (EFIAPI *EFI_FILE_SET_POSITION)(EFI_FILE *This, UINT64 Pos);
+typedef EFI_STATUS (EFIAPI *EFI_FILE_GET_POSITION)(EFI_FILE *This, UINT64 *Pos);
+typedef EFI_STATUS (EFIAPI *EFI_FILE_GET_INFO)(
+    EFI_FILE *This, EFI_GUID *InfoType, UINTN *BufferSize, void *Buffer);
+typedef EFI_STATUS (EFIAPI *EFI_FILE_SET_INFO)(
+    EFI_FILE *This, EFI_GUID *InfoType, UINTN BufferSize, const void *Buffer);
+typedef EFI_STATUS (EFIAPI *EFI_FILE_FLUSH)(EFI_FILE *This);
+
+struct efi_file {
+    UINT64                 FileKey;
+    EFI_FILE_OPEN          Open;
+    EFI_FILE_CLOSE         Close;
+    EFI_FILE_DELETE        Delete;
+    EFI_FILE_READ          Read;
+    EFI_FILE_WRITE         Write;
+    EFI_FILE_GET_POSITION  GetPosition;
+    EFI_FILE_SET_POSITION  SetPosition;
+    EFI_FILE_GET_INFO      GetInfo;
+    EFI_FILE_SET_INFO      SetInfo;
+    EFI_FILE_FLUSH         Flush;
+};
+
+typedef struct efi_simple_file_system_protocol EFI_SIMPLE_FILE_SYSTEM_PROTOCOL;
+typedef EFI_STATUS (EFIAPI *EFI_OPEN_VOLUME)(
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *This, EFI_FILE **Root);
+struct efi_simple_file_system_protocol {
+    UINT64        Revision;
+    EFI_OPEN_VOLUME OpenVolume;
+};
+
+static const EFI_GUID EFI_FILE_SYSTEM_PROTOCOL_GUID = {
+    0x964e5b22, 0x6459, 0x11d2,
+    {0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b}
+};
+
 _Static_assert(offsetof(EFI_SYSTEM_TABLE, BootServices) == 96,
                "EFI_SYSTEM_TABLE layout mismatch");
 _Static_assert(offsetof(EFI_BOOT_SERVICES, HandleProtocol) == 152,

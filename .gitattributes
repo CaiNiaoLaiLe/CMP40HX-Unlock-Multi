@@ -1,0 +1,57 @@
+# Line-ending policy for this repo.
+# The PVE(Linux) host runs install-efi.sh / check_unlock.sh / Makefile with sh/dash.
+# Windows core.autocrlf=true turns checked-out text files into CRLF; when those are
+# copied (scp/WinSCP binary) to PVE, dash reads `set -e\r` as "set: Illegal option -".
+# So all Linux-relevant text is forced to LF; Windows batch stays CRLF; binaries untouched.
+
+# --- Forced LF (scripts / sources / docs used on PVE) ---
+*.sh          text eol=lf
+*.bash        text eol=lf
+Makefile      text eol=lf
+makefile      text eol=lf
+*.mk          text eol=lf
+Kbuild        text eol=lf
+*.c           text eol=lf
+*.h           text eol=lf
+*.py          text eol=lf
+*.md          text eol=lf
+*.txt         text eol=lf
+*.json        text eol=lf
+*.patch       text eol=lf
+*.diff        text eol=lf
+*.service     text eol=lf
+*.sha256      text eol=lf
+.gitignore    text eol=lf
+.gitattributes text eol=lf
+
+# --- Forced CRLF (Windows-only batch) ---
+*.bat         text eol=crlf
+*.cmd         text eol=crlf
+
+# --- Binary: never touched by line-ending conversion ---
+*.efi         binary
+*.EFI         binary
+*.sys         binary
+*.dll         binary
+*.exe         binary
+*.bin         binary
+*.dat         binary
+*.rom         binary
+*.img         binary
+*.ico         binary
+*.png         binary
+*.jpg         binary
+*.jpeg        binary
+*.gif         binary
+*.bmp         binary
+*.zip         binary
+*.gz          binary
+*.xz          binary
+*.7z          binary
+*.jar         binary
+*.o           binary
+*.a           binary
+*.so          binary
+
+# --- Everything else: let git auto-detect ---
+*             text=auto

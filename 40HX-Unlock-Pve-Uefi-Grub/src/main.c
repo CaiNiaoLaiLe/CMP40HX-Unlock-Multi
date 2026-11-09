@@ -1,6 +1,7 @@
 #include "uefi_min.h"
 #include "core_abi.h"
 #include "elf_loader.h"
+#include "booter.h"
 
 #define CMP_VENDOR_ID 0x10deU
 #define CMP90HX_DEVICE_ID 0x220dU
@@ -29,7 +30,6 @@
 #define PCI_EXP_LNKSTA 0x12U
 #define PCI_EXP_LNKCTL2 0x30U
 #define PCI_EXP_LNKCTL_ASPM 0x0003U
-#define PCI_EXP_LNKCTL_DISABLE 0x0010U
 #define PCI_EXP_LNKCTL_RETRAIN 0x0020U
 #define PCI_EXP_LNKCTL_CCC 0x0040U
 #define PCI_EXP_LNKCTL_HAWD 0x0200U
@@ -53,6 +53,14 @@ extern const UINT8 _binary_nvpermissive_core_o_end[];
 static EFI_SYSTEM_TABLE *g_system_table;
 static EFI_BOOT_SERVICES *g_boot_services;
 
+/* Booter hard-hang diagnosis: every console_write line is also flushed to an
+ * ESP file so a blind (remote, no-screen) reboot can be read from Linux via
+ * /boot/efi/EFI/UNLOCK/LOGS/BOOTER_TRACE.TXT. Overwritten clean each boot.
+ * Best-effort: if the file cannot be opened the unlock still runs, only the
+ * trace is lost. */
+static EFI_FILE *g_trace_file;
+static EFI_FILE *g_trace_root;
+
 struct pci_location {
     EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *rb;
     UINT16 segment;
@@ -74,20 +82,29 @@ struct platform_gpu {
 enum requested_mode {
     REQUEST_EXIT,
     REQUEST_INSPECT,
-    REQUEST_FULL,
-    REQUEST_COMPUTE,
-    REQUEST_GRAPHICS,
-    REQUEST_GR_RESET,
-    REQUEST_GR_ACR,
-    REQUEST_GEN2,
-    REQUEST_GEN2_LD
+    REQUEST_BOOTER,
+    REQUEST_UNKNOWN
 };
+
+static void trace_tee(const char *text)
+{
+    UINTN len = 0;
+    if (!g_trace_file || !text)
+        return;
+    while (text[len])
+        len++;
+    if (len) {
+        g_trace_file->Write(g_trace_file, &len, text);
+        g_trace_file->Flush(g_trace_file);   /* survive a later hard hang */
+    }
+}
 
 static void console_write(const char *text)
 {
     CHAR16 wide[256];
     UINTN used = 0;
 
+    trace_tee(text);
     if (!g_system_table || !g_system_table->ConOut)
         return;
     while (*text) {
@@ -271,6 +288,120 @@ void SYSVABI gpu_log(struct gpu_dev *g, const char *format, ...)
     __builtin_va_end(args);
     console_write("[core] ");
     console_write(buffer);
+}
+
+static void to_wchar(const char *s, CHAR16 *out, UINTN cap)
+{
+    UINTN i = 0;
+    for (; s[i] && i + 1 < cap; i++)
+        out[i] = (CHAR16)s[i];
+    out[i] = 0;
+}
+
+static EFI_STATUS ensure_dir(EFI_FILE *root, const char *path_ascii)
+{
+    CHAR16 w[72];
+    EFI_FILE *dir = 0;
+    EFI_STATUS st;
+
+    if (!root || !root->Open)
+        return EFI_INVALID_PARAMETER;
+    to_wchar(path_ascii, w, ARRAY_SIZE(w));
+    /* Open first: parents like \EFI\UNLOCK already exist, so only create
+     * when truly missing. EFI_FILE_DIRECTORY must be 0x10 (bit 4). */
+    st = root->Open(root, &dir, w, EFI_FILE_MODE_READ, 0);
+    if (EFI_ERROR(st)) {
+        dir = 0;
+        st = root->Open(root, &dir, w,
+                EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE,
+                EFI_FILE_DIRECTORY);
+    }
+    if (!EFI_ERROR(st) && dir)
+        dir->Close(dir);
+    return st;
+}
+
+static int trace_try_volume(EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs)
+{
+    EFI_FILE *root = 0, *old = 0, *file = 0;
+    CHAR16 fp[72];
+
+    if (!fs || !fs->OpenVolume || EFI_ERROR(fs->OpenVolume(fs, &root)) || !root)
+        return 0;
+    ensure_dir(root, "\\EFI\\UNLOCK");
+    ensure_dir(root, "\\EFI\\UNLOCK\\LOGS");
+
+    to_wchar("\\EFI\\UNLOCK\\LOGS\\BOOTER_TRACE.TXT", fp, ARRAY_SIZE(fp));
+    /* clean overwrite: drop any previous file so no stale tail survives */
+    if (!EFI_ERROR(root->Open(root, &old, fp,
+            EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0)) && old)
+        old->Delete(old);   /* Delete closes the handle too */
+    if (EFI_ERROR(root->Open(root, &file, fp,
+            EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE,
+            EFI_FILE_ARCHIVE)) || !file) {
+        root->Close(root);
+        return 0;
+    }
+    g_trace_root = root;   /* keep volume open for the file's lifetime */
+    g_trace_file = file;
+    return 1;
+}
+
+static void trace_open(EFI_HANDLE image_handle)
+{
+    EFI_LOADED_IMAGE_PROTOCOL *li = 0;
+    EFI_HANDLE *handles = 0;
+    UINTN count = 0, i;
+
+    if (!g_boot_services)
+        return;
+    if (!EFI_ERROR(g_boot_services->HandleProtocol(
+            image_handle, (EFI_GUID *)&EFI_LOADED_IMAGE_PROTOCOL_GUID,
+            (void **)&li)) && li) {
+        EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = 0;
+        if (li->ParentHandle) {
+            fs = 0;
+            if (!EFI_ERROR(g_boot_services->HandleProtocol(
+                    li->ParentHandle,
+                    (EFI_GUID *)&EFI_FILE_SYSTEM_PROTOCOL_GUID, (void **)&fs))
+                && trace_try_volume(fs))
+                return;
+        }
+        if (li->DeviceHandle) {
+            fs = 0;
+            if (!EFI_ERROR(g_boot_services->HandleProtocol(
+                    li->DeviceHandle,
+                    (EFI_GUID *)&EFI_FILE_SYSTEM_PROTOCOL_GUID, (void **)&fs))
+                && trace_try_volume(fs))
+                return;
+        }
+    }
+    /* fallback: every handle that publishes the file system protocol */
+    if (!EFI_ERROR(g_boot_services->LocateHandleBuffer(
+            ByProtocol, (EFI_GUID *)&EFI_FILE_SYSTEM_PROTOCOL_GUID, 0,
+            &count, &handles))) {
+        for (i = 0; i < count; i++) {
+            EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = 0;
+            if (!EFI_ERROR(g_boot_services->HandleProtocol(
+                    handles[i], (EFI_GUID *)&EFI_FILE_SYSTEM_PROTOCOL_GUID,
+                    (void **)&fs)) && fs && trace_try_volume(fs))
+                break;
+        }
+        g_boot_services->FreePool(handles);
+    }
+}
+
+static void trace_close(void)
+{
+    if (g_trace_file) {
+        g_trace_file->Flush(g_trace_file);
+        g_trace_file->Close(g_trace_file);
+        g_trace_file = 0;
+    }
+    if (g_trace_root) {
+        g_trace_root->Close(g_trace_root);
+        g_trace_root = 0;
+    }
 }
 
 void *SYSVABI memcpy(void *destination, const void *source, size_t size)
@@ -541,6 +672,57 @@ static void *SYSVABI dma_alloc_below_4g(struct gpu_dev *g, size_t size,
     return (void *)(uintptr_t)address;
 }
 
+/* Above-4GiB identity-mapped reserved allocator, a faithful port of the
+ * v70 reference helper alloc_fwsec_buffer (unlock40x_v70.c L1245). The TU102
+ * booter reads WPR meta / V67 out of sysmem through a 64-bit mailbox and the
+ * locked 40HX blocks any <4G source page (exit 0x91), so every booter buffer must
+ * sit above 4 GiB. We walk 16 MiB-aligned slots from a moving cursor, fall
+ * back to three static candidates, and only as a last resort go below 4 G.
+ * The returned physical address is directly dereferenceable because UEFI
+ * identity-maps all DRAM (same assumption dma_alloc_below_4g already makes).
+ * Returns 0 on total failure. Exported so booter.c can call it. */
+static uint64_t booter_high_cursor = 0x110000000ULL;
+
+UINT64 booter_alloc_high(UINTN pages)
+{
+    EFI_STATUS status;
+    EFI_PHYSICAL_ADDRESS address;
+    static const EFI_PHYSICAL_ADDRESS candidates[] = {
+        0x1A0000000ULL, 0x1C0000000ULL, 0x1E0000000ULL,
+    };
+    UINTN i;
+
+    if (!g_boot_services || !pages)
+        return 0;
+
+    for (i = 0; i < 12; i++) {
+        address = booter_high_cursor + (uint64_t)i * 0x1000000ULL;
+        status = g_boot_services->AllocatePages(AllocateAddress,
+                    EfiReservedMemoryType, pages, &address);
+        if (!EFI_ERROR(status)) {
+            booter_high_cursor =
+                address + ((uint64_t)pages << 12) + 0x1000000ULL;
+            return (UINT64)address;
+        }
+    }
+
+    for (i = 0; i < ARRAY_SIZE(candidates); i++) {
+        address = candidates[i];
+        status = g_boot_services->AllocatePages(AllocateAddress,
+                    EfiReservedMemoryType, pages, &address);
+        if (!EFI_ERROR(status))
+            return (UINT64)address;
+    }
+
+    /* Last resort: a plain below-4G page allocation. On the locked 40HX the
+     * booter will reject this (mbox exit 0x91) but the caller still gets a
+     * coherent, logged failure instead of a silent 0. */
+    address = 0xffffffffULL;
+    status = g_boot_services->AllocatePages(AllocateMaxAddress,
+                EfiReservedMemoryType, pages, &address);
+    return EFI_ERROR(status) ? 0 : (UINT64)address;
+}
+
 static void SYSVABI dma_free(struct gpu_dev *g, void *memory, size_t size,
                              uint64_t physical)
 {
@@ -612,22 +794,16 @@ static int sbr_once(struct gpu_dev *g, UINT32 settle_ms)
 
 static int SYSVABI secondary_bus_reset(struct gpu_dev *g)
 {
-    gpu_log(g, "SBR via %04x:%02x:%02x.%u; settling 8 seconds\n",
+    gpu_log(g, "SBR via %04x:%02x:%02x.%u; settling 3 seconds\n",
             ((struct platform_gpu *)g->platform_data)->bridge.segment,
             ((struct platform_gpu *)g->platform_data)->bridge.bus,
             ((struct platform_gpu *)g->platform_data)->bridge.device,
             ((struct platform_gpu *)g->platform_data)->bridge.function);
-    return sbr_once(g, 8000U);
-}
-
-static int dual_sbr(struct gpu_dev *g)
-{
-    if (g->secondary_bus_reset(g))
-        return -1;
-    if (g->secondary_bus_reset(g))
-        return -1;
-    gpu_log(g, "dual SBR complete\n");
-    return 0;
+    /* The fixed settle below is only a conservative pad after the link is
+     * re-enabled; the real readiness gate is the device-ID poll inside
+     * sbr_once (up to 100 x 100 ms, breaking as soon as 10de:1f0b returns).
+     * 3 s is enough on this board and saves ~5 s per boot versus the old 8 s. */
+    return sbr_once(g, 3000U);
 }
 
 static UINT32 mmio_rd(uintptr_t base, UINT32 off)
@@ -829,60 +1005,6 @@ static void apply_gen2(struct gpu_dev *g)
     }
 }
 
-/* Research variant: the plain retrain above cannot always restart the physical
- * training. Dropping the link on the upstream port forces a full renegotiation
- * and is what reached Gen2 x16 on the Alder Lake test box. Run it before the OS
- * driver exists: the same sequence after RM/GSP init detaches the GPU, but in
- * UEFI there is no driver to detach. A failed run is recovered by power cycling. */
-static void apply_gen2_link_disable(struct gpu_dev *g)
-{
-    struct platform_gpu *platform = (struct platform_gpu *)g->platform_data;
-    UINT32 gpu_cap = 0;
-    UINT32 br_cap = 0;
-    UINT16 value = 0;
-    UINTN attempt;
-
-    apply_gen2(g);
-
-    if (find_pcie_cap(&platform->gpu, &gpu_cap) ||
-        find_pcie_cap(&platform->bridge, &br_cap)) {
-        console_write("gen2-ld: PCIe capability not found; skipped.\n");
-        return;
-    }
-    if (link_is_gen2(&platform->gpu, gpu_cap) &&
-        link_is_gen2(&platform->bridge, br_cap)) {
-        console_write("gen2-ld: already Gen2, Link Disable not needed.\n");
-        return;
-    }
-
-    console_write("\n== gen2-ld ==\ndropping the upstream link, then renegotiating\n");
-    if (EFI_ERROR(pci_read(&platform->bridge, br_cap + PCI_EXP_LNKCTL,
-                           EfiPciWidthUint16, &value)))
-        return;
-    value = (UINT16)(value | PCI_EXP_LNKCTL_DISABLE | PCI_EXP_LNKCTL_HAWD);
-    if (EFI_ERROR(pci_write(&platform->bridge, br_cap + PCI_EXP_LNKCTL,
-                            EfiPciWidthUint16, &value)))
-        return;
-    g_boot_services->Stall(200000U);
-
-    value = (UINT16)((value & ~PCI_EXP_LNKCTL_DISABLE) | PCI_EXP_LNKCTL_RETRAIN);
-    if (EFI_ERROR(pci_write(&platform->bridge, br_cap + PCI_EXP_LNKCTL,
-                            EfiPciWidthUint16, &value)))
-        return;
-    for (attempt = 0; attempt < 50; attempt++) {
-        g_boot_services->Stall(100000U);
-        if (link_is_gen2(&platform->gpu, gpu_cap) &&
-            link_is_gen2(&platform->bridge, br_cap))
-            break;
-    }
-    dump_link_state(&platform->gpu, gpu_cap, "gpu  ld    ");
-    dump_link_state(&platform->bridge, br_cap, "root ld    ");
-    if (link_is_gen2(&platform->gpu, gpu_cap))
-        console_write("gen2-ld: link renegotiated to Gen2.\n");
-    else
-        console_write("gen2-ld: link came back at Gen1.\n");
-}
-
 static int has_word(const CHAR16 *options, UINTN bytes, const char *word)
 {
     UINTN chars = bytes / sizeof(CHAR16);
@@ -917,31 +1039,13 @@ static enum requested_mode parse_mode(EFI_HANDLE image_handle)
 #endif
     }
     if (has_word((const CHAR16 *)loaded->LoadOptions,
-                 loaded->LoadOptionsSize, "full"))
-        return REQUEST_FULL;
-    if (has_word((const CHAR16 *)loaded->LoadOptions,
-                 loaded->LoadOptionsSize, "compute"))
-        return REQUEST_COMPUTE;
-    if (has_word((const CHAR16 *)loaded->LoadOptions,
-                 loaded->LoadOptionsSize, "graphics"))
-        return REQUEST_GRAPHICS;
-    if (has_word((const CHAR16 *)loaded->LoadOptions,
-                 loaded->LoadOptionsSize, "gr-reset"))
-        return REQUEST_GR_RESET;
-    if (has_word((const CHAR16 *)loaded->LoadOptions,
-                 loaded->LoadOptionsSize, "gr-acr"))
-        return REQUEST_GR_ACR;
-    if (has_word((const CHAR16 *)loaded->LoadOptions,
-                 loaded->LoadOptionsSize, "gen2-ld"))
-        return REQUEST_GEN2_LD;
-    if (has_word((const CHAR16 *)loaded->LoadOptions,
-                 loaded->LoadOptionsSize, "gen2"))
-        return REQUEST_GEN2;
+                 loaded->LoadOptionsSize, "booter"))
+        return REQUEST_BOOTER;
     return REQUEST_INSPECT;
 }
 
 static int run_one(struct core_image *core, struct gpu_dev *gpu, int mode,
-                   const char *name, int reset_after)
+                   const char *name)
 {
     int result;
     console_printf("\n== %s ==\n", name);
@@ -949,10 +1053,6 @@ static int run_one(struct core_image *core, struct gpu_dev *gpu, int mode,
     if (result) {
         console_printf("%s failed: %d\n", name, result);
         return result;
-    }
-    if (reset_after && dual_sbr(gpu)) {
-        console_printf("%s completed, but required dual SBR failed\n", name);
-        return -1;
     }
     console_printf("%s complete\n", name);
     return 0;
@@ -964,48 +1064,52 @@ static int run_requested(enum requested_mode request, struct core_image *core,
     if (request == REQUEST_EXIT)
         return 0;
     if (request == REQUEST_INSPECT)
-        return run_one(core, gpu, NVPERM_MODE_GR_INSPECT, "read-only inspect", 0);
-    if (request == REQUEST_COMPUTE) {
-        int r = run_one(core, gpu, NVPERM_MODE_COMPUTE, "compute", 1);
-        if (!r)
-            apply_gen2(gpu);
-        return r;
-    }
-    if (request == REQUEST_GEN2) {
+        return run_one(core, gpu, NVPERM_MODE_GR_INSPECT, "read-only inspect");
+    if (request == REQUEST_BOOTER) {
+        /* DIRECT_SEC2 compute unlock: driven entirely by the main EFI
+         * image (booter.c), not the core ELF. booter_run() first issues one
+         * normalize SBR (so a BIOS- or earlier-attempt-latched WPR2 cannot
+         * wedge the port-load), does its engine reset, and on the success path
+         * issues no further SBR - the SS0/SS1 the booter just wrote survive
+         * into the Gen2 + ReBAR tail below, so a single boot delivers compute
+         * unlock, Gen2 link and the 8 GiB BAR. ReBAR stays last because it is
+         * the step that must follow the last bus reset. */
+        int r;
+        console_write("\n== booter (DIRECT_SEC2) ==\n");
+        r = booter_run(gpu);
+        if (r) {
+            console_write("booter: DIRECT_SEC2 did not reach UNLOCKED; "
+                          "Gen2 and ReBAR skipped (link and BAR left as-is).\n");
+            /* The fwsec step latched WPR2 even though the booter did not
+             * unlock. Leaving it set makes the OS driver abort its GSP boot
+             * ("unexpected WPR2 already up" -> nvidia-smi: No devices were
+             * found). Reset the endpoint so the driver instead binds a clean,
+             * locked CMP 40HX: the worst case becomes "not boosted", never
+             * "device missing". This is the in-band version of the old
+             * "power the machine fully off before retrying" instruction. */
+            console_write("booter: cleanup SBR to clear latched WPR2 for the OS driver...\n");
+            if (secondary_bus_reset(gpu))
+                console_write("booter: cleanup SBR failed; a full power-off is required.\n");
+            return r;
+        }
         apply_gen2(gpu);
+        if (run_one(core, gpu, NVPERM_MODE_REBAR, "rebar"))
+            console_write("rebar unlock failed; BAR1 stays 64 MiB (harmless).\n");
         return 0;
     }
-    if (request == REQUEST_GEN2_LD) {
-        apply_gen2_link_disable(gpu);
-        return 0;
-    }
-    if (request == REQUEST_GRAPHICS)
-        return run_one(core, gpu, NVPERM_MODE_GRAPHICS, "graphics", 1);
-    if (request == REQUEST_GR_RESET)
-        return run_one(core, gpu, NVPERM_MODE_GR_RESET, "gr-reset", 1);
-    if (request == REQUEST_GR_ACR)
-        return run_one(core, gpu, NVPERM_MODE_GR_ACR, "gr-acr", 0);
 
-    console_write("\nEstablishing a clean initial SEC2 session...\n");
-    if (dual_sbr(gpu))
-        return -1;
-    if (run_one(core, gpu, NVPERM_MODE_COMPUTE, "compute", 1))
-        return -1;
-    if (run_one(core, gpu, NVPERM_MODE_GRAPHICS, "graphics", 1))
-        return -1;
-    if (run_one(core, gpu, NVPERM_MODE_GR_RESET, "gr-reset", 1))
-        return -1;
-    if (run_one(core, gpu, NVPERM_MODE_GR_ACR, "gr-acr", 0))
-        return -1;
-    apply_gen2(gpu);
-    return 0;
+    /* REQUEST_FULL / COMPUTE / GRAPHICS / GR_* were retired once the booter
+     * one-shot covered the whole chain; an unknown word decodes as
+     * REQUEST_UNKNOWN here and inspect is already handled above. */
+    console_write("Unknown mode; nothing executed.\n");
+    return -1;
 }
 
 /* v29.67: interactive menu + key-wait so the user can SEE the tool running
  * (previously: booting the stick fell through to Windows - tool never ran).
- * 等待按键的时长: 1 tick = Stall(10us), 1000000 ticks = 10 秒。
- * 想改长/改短只改这一个数 (1000000 -> N*100000)。 */
-#define WAIT_KEY_TICKS 1000000U
+ * 等待按键的时长: 1 tick = Stall(10us), 500000 ticks = 5 秒。
+ * 想改长/改短只改这一个数 (N 秒 -> N*100000)。 */
+#define WAIT_KEY_TICKS 500000U
 
 static int wait_any_key(void)
 {
@@ -1028,21 +1132,21 @@ static enum requested_mode interactive_menu(void)
     EFI_SIMPLE_TEXT_INPUT_PROTOCOL *conin =
         (EFI_SIMPLE_TEXT_INPUT_PROTOCOL *)g_system_table->ConIn;
     EFI_INPUT_KEY key;
-    console_write("\n======== CMP40HX UEFI Unlock Tool (v29.67) ========\n");
+    console_write("\n======== CMP40HX UEFI Unlock Tool (v29.68) ========\n");
     console_write("  Target : NVIDIA 10de:1f0b (CMP 40HX)\n");
     console_write("  [1] inspect  - read-only check (safe, run this first)\n");
-    console_write("  [2] full     - unlock sequence (FP32/tensor/Gen2 + PDISP probe)\n");
-    console_write("  [3] boot PVE/Linux now (do nothing)\n");
+    console_write("  [2] boot PVE/Linux now (do nothing)\n");
+    console_write("  [3] booter  - one-shot: DIRECT_SEC2 compute unlock + Gen2 + ReBAR (v70 port)\n");
     console_write("\n  Select mode: ");
     for (;;) {
         if (conin && conin->ReadKeyStroke &&
             !EFI_ERROR(conin->ReadKeyStroke(conin, &key))) {
             if (key.UnicodeChar == L'1')
                 return REQUEST_INSPECT;
-            if (key.UnicodeChar == L'2')
-                return REQUEST_FULL;
-            if (key.UnicodeChar == L'3' || key.ScanCode == 0x17)
+            if (key.UnicodeChar == L'2' || key.ScanCode == 0x17)
                 return REQUEST_EXIT;
+            if (key.UnicodeChar == L'3')
+                return REQUEST_BOOTER;
             if (key.UnicodeChar == 0x0D)
                 return REQUEST_INSPECT;
         }
@@ -1066,6 +1170,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
     g_boot_services = system_table ? system_table->BootServices : 0;
     if (!g_boot_services)
         return EFI_INVALID_PARAMETER;
+    trace_open(image_handle);   /* mirror all console_write to ESP for hang diagnosis */
     memset(&platform, 0, sizeof(platform));
     memset(&core, 0, sizeof(core));
     memset(&gpu, 0, sizeof(gpu));
@@ -1087,6 +1192,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
 
     if (request == REQUEST_EXIT) {
         console_write("No action requested. Boot Linux.\n");
+        trace_close();
         return EFI_SUCCESS;
     }
 
@@ -1166,6 +1272,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
     if (result) {
         console_printf("\nFAILED (%d). Power the machine fully off before retrying.\n",
                        result);
+        trace_close();
         return EFI_DEVICE_ERROR;
     }
     if (request == REQUEST_INSPECT) {
@@ -1174,7 +1281,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
         console_write("\nUNLOCK SEQUENCE COMPLETED.\n");
         console_write("Boot Linux without powering off.\n");
     }
-    console_write("\nPress any key to continue booting PVE/Linux (auto in 10s)...\n");
+    console_write("\nPress any key to continue booting PVE/Linux (auto in 5s)...\n");
     wait_any_key();
+    trace_close();
     return EFI_SUCCESS;
 }

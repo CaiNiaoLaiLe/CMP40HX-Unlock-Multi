@@ -114,9 +114,9 @@ CPU (Xeon E7 v4 IIO)
 
 | 文件 | 体积 | 作用 |
 |---|---|---|
-| `Makefile` | 3.2 KB / 70 行 | 编译 + `objcopy` 嵌入 core + `ld -mi386pep` 链接 + `verify_efi.py` 校验；`make release` 一次产出三个模式并刷新 `CHECKSUMS.sha256` |
-| `install-efi.sh` | 19 KB / 429 行 | 安装器：拷 3 个 `.efi` 到 ESP、从 `grub.cfg` 抽取 PVE 原条目、生成 `/etc/grub.d/40-cmp40hx`（3 个菜单项）、`update-grub`；支持交互选「1 编译安装 / 2 预编译安装」，以及 `--build` / `--prebuilt` / `--force` / `--default` / `--timeout` |
-| `uninstall-efi.sh` | 0.4 KB / 12 行 | 删除菜单项与 ESP 目录，回到工厂状态 |
+| `Makefile` | 5.7 KB / 129 行 | 编译 + `objcopy` 嵌入 core + `ld -mi386pep` 链接（**直接输出到 `build/efi/`**，不留中间副本）+ `verify_efi.py` 校验；`make release` 一次产出 inspect/booter 两个模式到 `build/efi/` 并刷新 `build/efi/CHECKSUMS.sha256` |
+| `install-efi.sh` | 25.7 KB / 628 行 | 安装器：第 1 步幂等补齐两个 ReBAR Linux 前置（`/etc/modprobe.d/nvidia-rebar.conf` 的 `NVreg_EnableResizableBar=1` 与 `/etc/default/grub` 的 `pci=realloc`，已有不动、缺失才写，改完先 `update-grub` 再烘焙），再拷 `.efi` 到 ESP、从 `grub.cfg` 抽取 PVE 原条目、生成 `/etc/grub.d/40-cmp40hx`、`update-grub`；收尾再做一次默认启动项幂等检查（`GRUB_DEFAULT` 未指向本方案则自动补 `booter`，已指向本方案或被有意设成其它真实条目则不动）；支持交互选「1 编译安装 / 2 预编译安装」，以及 `--build` / `--prebuilt` / `--force` / `--default` / `--no-default` / `--timeout` |
+| `uninstall-efi.sh` | 4.2 KB / 81 行 | 删除菜单项与 ESP 目录，并对称回收三处配置改动（同样幂等：有就删、没有跳过）：① `nvidia-rebar.conf` 仅在内容为纯本方案行时才删，防误删用户自管同名文件；② `pci=realloc` 从 `GRUB_CMDLINE_LINUX_DEFAULT` 摘除；③ `GRUB_DEFAULT` 只当它指向本方案条目时才清除（单/双/无引号三种写法都认，指向其它条目一律不动），并把 `GRUB_TIMEOUT` 恢复为 PVE 出厂值 5，`GRUB_TIMEOUT_STYLE=hidden` 时额外提醒 5 秒不显示菜单；最后 `update-grub` |
 | `tools/verify_efi.py` | 1.3 KB / 31 行 | 校验产物是合法 PE32+ / x86-64 / subsystem=10（EFI 应用） |
 
 > 上游还带过 `tools/fetch-core.sh`、`tools/verify_core.py`（下载并校验 GA102 版 core），
@@ -126,14 +126,18 @@ CPU (Xeon E7 v4 IIO)
 
 | 文件 | 作用 |
 |---|---|
-| `NVPermissiveEFI.efi` | inspect 模式（无 LoadOptions 时的兜底） |
-| `NVPermissiveEFI-COMPUTE.efi` | compute 模式 |
-| `NVPermissiveEFI-FULL.efi` | full 模式 |
-| `CHECKSUMS.sha256` | 三个 `.efi` 的 SHA256，`make release` 会覆盖 |
+| `build/efi/NVPermissiveEFI-INSPECT.efi` | inspect 模式（无参数启动时的兜底） |
+| `build/efi/NVPermissiveEFI-BOOTER.efi` | booter 一条龙模式 |
+| `build/efi/CHECKSUMS.sha256` | 两个 `.efi` 的 SHA256，`make release` 会覆盖 |
 | `doc/CMP40HX-Unlock-操作手册.md` | 从装机到验收的完整步骤、参数详解、故障分流表、回退 |
 | `doc/CMP40HX-Gen2链路问题说明.md` | Gen2 从卡住到跑通的完整实验记录与根因分析 |
 | `doc/CMP40HX-Unlock-项目总结.md` | 本文 |
 | `README.md` | 项目构成、文件职责、硬件环境、原理速览 |
+
+> 产物文件名里的 `INSPECT` / `BOOTER` 只描述**无参数启动时的默认模式**（编译期 `-DAUTO_MODE`）；
+> 从 GRUB 菜单进来时菜单项会显式传 `inspect` / `booter`，**运行时以参数为准**。
+> 旧版无后缀的 `NVPermissiveEFI.efi` 已改名；`uninstall-efi.sh` 是整个删 `EFI/UNLOCK` 目录，
+> 因此升级重装后 ESP 里不会残留旧名文件。
 
 ### 3.4 `main.c` 内部函数地图
 
@@ -231,7 +235,7 @@ menuentry "PVE + CMP40HX UNLOCK (compute, ...)" {
 
 | 模式 | 载体文件 | 动作 | SBR 次数 | 预估耗时 |
 |---|---|---|---|---|
-| `inspect` | `NVPermissiveEFI.efi` | 只读打印 BOOT0 / XP3G / FECS_PLM / SS0 / SS0_RD / SS1 / FUSE_DISP / PDISP | 0 | 秒级 |
+| `inspect` | `NVPermissiveEFI-INSPECT.efi` | 只读打印 BOOT0 / XP3G / FECS_PLM / SS0 / SS0_RD / SS1 / FUSE_DISP / PDISP | 0 | 秒级 |
 | `compute` | `NVPermissiveEFI-COMPUTE.efi` | 全套算力寄存器 + 1 次双重 SBR + Gen2 | 2 次单 SBR | ~30 s |
 | `full` | `NVPermissiveEFI-FULL.efi` | compute → graphics → gr-reset → gr-acr，最后 Gen2 | 8 次单 SBR | ~85 s |
 | `gen2`（源码保留） | 任意 `.efi` 传参 | 只写 Gen2 策略 + 重训，不写算力寄存器、不复位 | 0 | 秒级 |
@@ -265,11 +269,13 @@ sbr_once():
   清 0x40
   Stall 1 s
   restore_gpu_config()      // 写回 SBR 前备份的 6 个 BAR + COMMAND
-  Stall settle_ms (8000)
+  Stall settle_ms (3000)
   轮询设备 ID（最多 100 次 × 100 ms），与首次扫描保存的 expected_id 比较
 ```
 
-`dual_sbr()` = 连续两次 `sbr_once(8000)`。
+`booter` 一条龙只在入口做一次 `sbr_once(3000)`（归零复位）；早期 `compute`/`full` 的 `dual_sbr()`（连续两次 `sbr_once`）已随这两个模式退役、代码里不再存在。
+
+settle 从 8000ms 降到 3000ms **只压缩了 `restore_gpu_config()` 之后的那段保守静置垫**：紧随其后还有设备 ID 轮询（最多 100×100 ms，一读到 `10de:1f0b` 就放行）作为真正的就绪门，所以缩短它不影响复位可靠性。注意这与 §9.1 被撤销的「改撤复位→写 BAR 之间的 1 s」是**两处不同的时间**，后者才是不能动的。
 
 **两处细节值得注意：**
 
@@ -497,6 +503,8 @@ nvidia-smi: NVIDIA CMP 40HX, 8192MiB, P8, 14W/184W
 BAR 重试 10 次、加日志）。**实测证明这个判断是错的**——回退原版重新编译后，同一台机器、
 同一张卡跑通了。该重写已撤销。
 
+> 后记：现在 `sbr_once()` 里 `restore_gpu_config()` **之后**的 settle 已从 8 s 缩到 3 s（见 §5.3），但它后面有设备 ID 轮询兜底，和被撤销的「撤复位→写 BAR 之间的 1 s」不是同一处，别混为一谈。
+
 真正的原因在构建/安装环节：
 
 | 现象 | 真实原因 |
@@ -505,8 +513,8 @@ BAR 重试 10 次、加日志）。**实测证明这个判断是错的**——�
 | 屏幕停在 `settling 8 seconds` 后无输出 | 早期那份二进制本身有问题；正常产物会继续，整段 SBR 沉降 + 轮询最长约 20 秒，等不够也会误判成「卡死」 |
 | 同一份脚本今天能跑、明天报 `set: Illegal option -` | 从 Windows 拷过去的 `.sh` 带了 CRLF（`sed -i 's/\r$//'` 解决） |
 
-**判据**：`install-efi.sh` 安装时会打印 ESP 里三个 `.efi` 的 SHA256，与仓库里
-`sha256sum NVPermissiveEFI*.efi` 逐条对比，不一致就是装错了。
+**判据**：`install-efi.sh` 安装时会打印 ESP 里两个 `.efi` 的 SHA256，与仓库里
+`( cd build/efi && sha256sum -c CHECKSUMS.sha256 )` 对账，不一致就是装错了。
 
 本仓库相对上游保留的改动，收敛为三类：
 
@@ -517,7 +525,7 @@ BAR 重试 10 次、加日志）。**实测证明这个判断是错的**——�
 3. `src/main.c` **`apply_gen2()` 的重训逻辑**（双端 CCC 对齐、HASD、HAWD、清 ASPM/LBMS、
    双端全字段打印）。
 
-解锁寄存器表与 SBR 时序仍是上游原版。
+解锁寄存器表与 SBR 的核心时序（撤复位→写 BAR 的 1 s）仍是上游原版；唯一改动是 §5.3 所述、把复位后有 ID 轮询兜底的那段 settle 静置垫从 8 s 缩到 3 s。
 
 ### 9.2 Gen2 环节（同一天，误判史）
 

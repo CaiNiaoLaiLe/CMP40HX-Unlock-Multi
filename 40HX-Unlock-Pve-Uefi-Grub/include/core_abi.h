@@ -43,11 +43,15 @@ _Static_assert(offsetof(struct gpu_dev, platform_data) == 112,
 _Static_assert(sizeof(struct gpu_dev) == 120,
                "gpu_dev ABI size mismatch");
 
-#define NVPERM_MODE_COMPUTE 1
-#define NVPERM_MODE_GRAPHICS 2
-#define NVPERM_MODE_GR_RESET 3
-#define NVPERM_MODE_GR_ACR 4
 #define NVPERM_MODE_GR_INSPECT 5
+#define NVPERM_MODE_REBAR 6
+/* DIRECT_SEC2 compute unlock. Not dispatched through the core ELF
+ * (do_permissive): the booter flow lives in the main EFI image and is driven
+ * by booter_run(); the value only keeps the mode namespace contiguous. */
+#define NVPERM_MODE_BOOTER 7
+/* Modes 1-4 (COMPUTE/GRAPHICS/GR_RESET/GR_ACR, direct register override)
+ * were retired with the compute/full EFI modes; the booter one-shot
+ * (DIRECT_SEC2) replaces them. */
 
 typedef int (SYSVABI *do_permissive_fn)(struct gpu_dev *, int);
 

@@ -39,53 +39,53 @@ NVIDIA **CMP 40HX**（TU106，`10de:1f0b`）的 **UEFI 前置解锁**方案。
 
 | 文件 | 作用 |
 |---|---|
-| `src/main.c` | UEFI 应用主体：模式解析、PCI 扫描定位 `10de:1f0b`、选最近的上游桥、解码 BAR0/BAR1、BOOT0 校验、SBR、`apply_gen2()` 链路重训、屏幕输出、`efi_main` |
-| `src/core_40hx.c` | 真正写算力寄存器的核心（XP3G / FECS_PLM / SS0 / SS1 / consumer chain），编译成 ELF 后嵌入 `.efi`，运行时加载执行 |
+| `src/main.c` | UEFI 应用主体：模式解析、PCI 扫描定位 `10de:1f0b`、选最近的上游桥、解码 BAR0/BAR1、BOOT0 校验、SBR、`apply_gen2()` 链路重训、日志落盘、`efi_main` |
+| `src/booter.c` | **booter 一条龙核心**：DIRECT_SEC2 特权启动（v70 移植），经 SEC2/GSP boot 提权后写 SS0/SS1 完成算力解锁，不做 SBR |
+| `src/core_40hx.c` | 嵌入的 core ELF：只读 inspect 寄存器回显 + ReBAR XVE aperture 解锁（compute/full 直接写寄存器路径已随 booter 一条龙退役） |
 | `src/elf_loader.c` | 把嵌入的 SysV ELF 加载到 2 GiB 以下，处理重定位并用 trampoline 接上外部符号 |
 | `include/core_abi.h` | core 与 UEFI 宿主之间的 ABI，含 `_Static_assert` 的偏移/长度校验（`platform_data`=112、size=120） |
+| `include/booter*.h`、`include/elf64_min.h`、`include/elf_loader.h` | booter 寄存器/资产/WPR 元数据，与 ELF64 加载器接口 |
 | `include/uefi_min.h` | 不依赖 EDK2 的极简 UEFI 类型与协议定义 |
-| `include/elf64_min.h`、`include/elf_loader.h` | ELF64 结构与加载器接口 |
-| `Makefile` | 一次产出三种模式：core 编译 → `objcopy` 包成 `.core` 段 → `ld -mi386pep` 链接 → `verify_efi.py` 校验 |
-| `install-efi.sh` | 安装器：三个 `.efi` 拷进 ESP、生成 `/etc/grub.d/40-cmp40hx`（3 个菜单项）、`update-grub`；支持交互选「1 编译安装 / 2 预编译安装」，或 `--build` / `--prebuilt` / `--force` / `--default` / `--timeout` |
-| `uninstall-efi.sh` | 删除菜单项与 ESP 目录，回到工厂状态 |
+| `Makefile` | 一次产出两种模式：core 编译 → `objcopy` 包成 `.core` 段 → `ld -mi386pep` 链接（直接输出到 `build/efi/`）→ `verify_efi.py` 校验 |
+| `assets/` | booter 必需的 7 个固件资产（`.bin`，自包含副本）；仅链接 booter 变体时使用，同步本目录即可构建 |
+| `install-efi.sh` | 安装器：两个 `.efi` 拷进 ESP、生成 `/etc/grub.d/40-cmp40hx`（2 个菜单项）、`update-grub`，收尾检查开机默认项（未指向本方案则自动补 `booter`）；支持交互选「1 编译安装 / 2 预编译安装」，或 `--build` / `--prebuilt` / `--force` / `--default` / `--no-default` / `--timeout` |
+| `uninstall-efi.sh` | 删除菜单项与 ESP 目录，并回收两个 ReBAR 前置与 `GRUB_DEFAULT`（仅当它指向本方案时清除）、倒计时恢复 `GRUB_TIMEOUT=5`，回到工厂状态 |
 | `tools/verify_efi.py` | 校验产物是合法的 PE32+ / x86-64 / subsystem=10（EFI 应用） |
-| `CHECKSUMS.sha256` | 三个 `.efi` 的 SHA256，`make release` 会刷新 |
-| `NVPermissiveEFI.efi` | inspect 模式（无 LoadOptions 时的兜底） |
-| `NVPermissiveEFI-COMPUTE.efi` | compute 模式 |
-| `NVPermissiveEFI-FULL.efi` | full 模式 |
+| `tools/check_unlock.sh` | 进系统后的验收脚本（gen2 / rebar / compute / booter trace 分项 PASS/WARN/FAIL，内置 BAR0 只读回显） |
+| `build/efi/NVPermissiveEFI-INSPECT.efi` | inspect 模式（无参数启动时的安全默认）；`make` 直接输出到此，一个模式只有一份 |
+| `build/efi/NVPermissiveEFI-BOOTER.efi` | booter 一条龙模式（日常用这个）；`make` 产物 |
+| `build/efi/CHECKSUMS.sha256` | 两个 `.efi` 的 sha256 清单，`make release` 自动刷新；预编译模式安装前可 `sha256sum -c` 对账 |
 | `doc/` | 四份文档，见文末「文档索引」 |
 
 ---
 
 ## 运行模式
 
+两个镜像的区别只在**无参数启动时的默认模式**（编译期 `-DAUTO_MODE`）；从 GRUB 菜单进入时
+菜单项会显式传 `inspect` / `booter` 参数，**运行时以参数为准**，文件名主要供人识别。
+
 | 模式 | 载体 | 行为 |
 |---|---|---|
-| `inspect`（默认） | `NVPermissiveEFI.efi` | 只读：打印 BOOT0 / 各寄存器现值，不写、不复位，零风险 |
-| `compute` | `NVPermissiveEFI-COMPUTE.efi` | 全套算力寄存器 + 1 次双重 SBR + Gen2 重训，日常用这个（开机约慢 30 秒） |
-| `full` | `NVPermissiveEFI-FULL.efi` | compute → graphics → gr-reset → gr-acr，8 次单 SBR，对齐 Windows 完整解锁（约 85 秒） |
+| `inspect`（默认） | `NVPermissiveEFI-INSPECT.efi` | 只读：打印 BOOT0 / 各寄存器现值，不写、不复位，零风险 |
+| `booter`（日常用） | `NVPermissiveEFI-BOOTER.efi` | 一条龙：DIRECT_SEC2 算力提权 → Gen2 重训 → ReBAR 8 GiB。走 SEC2/GSP boot 提权写 SS0/SS1，不经 core ELF、不做 SBR |
 
-`gen2` 与 `gen2-ld` 两个模式仍保留在源码里（靠 GRUB 传参触发），但**不生成菜单项**：
-`compute` 末尾已经包含 Gen2 策略与重训，单独再跑一次没有意义；
-`gen2-ld`（上游 Link Disable 强制重训）在 CCC 对齐后已不需要，且断链有风险。
+> `compute` / `full` / `gen2` / `gen2-ld` 等早期独立模式**已从源码移除**：booter 一条龙已完整覆盖其效果（实测 compute/gen2/rebar 均 PASS）；
+> 直接写寄存器被 SEC2 权限层丢弃的历史路线已由 booter 特权启动取代。
 
 ---
 
 ## 原理速览
 
-### 算力寄存器（BAR0）
+### 算力寄存器（BAR0）—— booter 目标终态参考
 
-| 偏移 | 写入值 | 作用 |
+DIRECT_SEC2 在 SEC2 特权环境下最终写入的目标值（历史直接写寄存器路径已退役，以下为成功后的预期寄存器态）：
+
+| 偏移 | 目标值 | 作用 |
 |---|---|---|
 | `0x008E1B0` XP3G_PLM | `0xFFFFFFFF` | 功耗/性能锁 PLM 清除 |
 | `0x409650` FECS_PLM | `0xFFFFFFFF` | FECS 性能锁清除 |
 | `0x409664` SS0 | `0x88888888` | SM 速度选择子（Tensor/FP16 的核心） |
 | `0x40966C` SS1 | `0x00000008` | 配套状态位 |
-| `0x0088610` XVE_08610 | `0x00001001` | 链路配置（与 RTX 2070 vBIOS 同值） |
-| `0x409500` / `0x40960C` / `0x409610` / `0x409614` | `0xFFFFFFFF` | consumer chain |
-
-`graphics` 阶段追加 `0x419B54=0xFF`、`0x600000=0xFFFFFFFF`（显示探测，无害）。
-SBR = 两次 PCI 二次总线复位（桥 `CTL 0x3e` 位 `0x40`），间隔 100 ms 沉降。
 
 目标值与公开 spec（ngthaihoc/CMP30HXmodtoGEN2）交叉核对一致。
 
@@ -106,27 +106,45 @@ SBR = 两次 PCI 二次总线复位（桥 `CTL 0x3e` 位 `0x40`），间隔 100 
 
 详细数据和推理过程见 [`doc/CMP40HX-Gen2链路问题说明.md`](doc/40HX-Gen2链路问题说明)。
 
+### ReBAR（8 GiB BAR1 aperture，v29.68 新增）
+
+三个普通 MMIO 写（与 Gen2 同属 XVE 族，**无需 Booter 特权**），booter 一条龙里在算力提权与 Gen2 之后最后执行（booter 不做 SBR，无地址冲突）：
+
+| BAR0 偏移 | 写入 | 作用 |
+|---|---|---|
+| `0x88724` CYA | `0x30` | XVE override 解锁 |
+| `0x88DCC` CFG | selector 7 + bit31 | 可选尺寸表 `0x400` → `0x7fc00`（8 GiB 进入列表） |
+| `0x88BC0` RBAR-CTL | bits[13:8]=13 | 标准 PCIe Resizable BAR 控制，选定 `2^13 MiB = 8 GiB` |
+
+仅以 CFG 回读作为解锁成功判据（CYA 是只写 key、CTL 是固件镜像，都不作硬判据），真正失败才回写原值（失败形态 = ReBAR 没开，BAR1 维持 64 MiB，无副作用）。
+Linux 侧接手：`NVreg_EnableResizableBar=1`（原生驱动模块参数，非改驱动）完成 BAR1 重分配，
+内核命令行还需 `pci=realloc` 允许内核重排 BAR、撑大上游桥窗口。
+这两项前置由 `install-efi.sh` 安装时自动幂等补齐（已有则不动），`uninstall-efi.sh` 对称回收。
+寄存器值移植自驱动补丁 `0003-cmp40hx-rebar-unlock`（来源：驱动补丁方案 `40HX-Unlock-Drive-Patch`，仅溯源说明，本目录构建不依赖它）；
+“UEFI 解锁 + 原生驱动 resize”这个组合上游未验证，以本机实测为准。
+
 ---
 
 ## 构建
 
-依赖 `gcc` / GNU `ld`（支持 `-mi386pep`）/ `objcopy` / `python3`：
+依赖 `gcc` / GNU `ld`（支持 `-mi386pep`）/ `objcopy` / `python3`。
+两个方案项目完全独立：booter 固件资产已自包含在本目录 `assets/` 里，
+同步/拷贝只需要 `40HX-Unlock-Pve-Uefi-Grub/` 这一个目录就能 `make`：
 
 ```bash
 apt install -y build-essential binutils python3
-make release                      # 一次产出三个模式并刷新 CHECKSUMS.sha256
-sha256sum -c CHECKSUMS.sha256
+make release                      # 一次产出两个模式到 build/efi/ 并刷新 build/efi/CHECKSUMS.sha256
+( cd build/efi && sha256sum -c CHECKSUMS.sha256 )
 ```
 
 单独构建某个模式：
 
 ```bash
-make clean && make                       # NVPermissiveEFI.efi
-make clean && make AUTO=REQUEST_COMPUTE  # NVPermissiveEFI-COMPUTE.efi
-make clean && make AUTO=REQUEST_FULL     # NVPermissiveEFI-FULL.efi
+make clean && make                          # build/efi/NVPermissiveEFI-INSPECT.efi（inspect）
+make clean && make AUTO=REQUEST_BOOTER      # build/efi/NVPermissiveEFI-BOOTER.efi（booter）
 ```
 
-仓库里的预编译 `.efi` **不会**自动包含源码改动。改了源码就用
+仓库里 `build/efi/` 下的预编译 `.efi` **不会**自动包含源码改动。改了源码就用
 `sh install-efi.sh --build`（或交互模式选 1）重新编译并安装。
 
 `ld` 若报 `unrecognised emulation mode: i386pep`，改用 mingw 交叉工具链：
@@ -151,9 +169,15 @@ reboot
 |---|---|
 | `sh install-efi.sh --build` | 先 `make release` 再安装 |
 | `sh install-efi.sh --prebuilt` | 直接用现成的 `.efi`（默认） |
-| `sh install-efi.sh --force --default=compute --timeout=5` | 用现成 `.efi`，已装则直接重装，并把默认项设为 compute |
+| `sh install-efi.sh --force --default=booter --timeout=5` | 用现成 `.efi`，已装则直接重装，并把默认项设为 booter |
+| `sh install-efi.sh --force --timeout=5` | 不给 `--default` 也一样：收尾发现 `GRUB_DEFAULT` 没指向本方案（出厂的 `=0` 也算）就自动补 `booter` |
+
+默认项检查是幂等的：已指向本方案（不管 inspect 还是 booter）就不动；被有意设成另一个真实存在的条目
+也尊重不动，只提示怎么改。要让开机保持普通 PVE（不解锁）加 `--no-default`。
 
 只有 `--build` 才编译；其余情况一律用仓库里现成的 `.efi`，不需要编译环境。
+安装时会自动幂等补齐两个 Linux 侧 ReBAR 前置（`/etc/modprobe.d/nvidia-rebar.conf`
+与 `/etc/default/grub` 的 `pci=realloc`），卸载脚本对称回收，无需手工配置。
 安装细节、菜单项说明、无头机设默认项、回退步骤全部在操作手册里。
 
 ---
@@ -171,6 +195,21 @@ nvidia-smi
 
 FP16 用 CUDA 基准（HGEMM / pytorch `float16 matmul`）实测，解锁成功约 50 TFLOPS 档。
 受 Gen2 x16（~6.4 GB/s）与 8 GB 显存限制，别拿它和桌面卡比。
+
+```bash
+# ReBAR：BAR1 应为 8 GiB（EFI 阶段先解锁 aperture，Linux 侧驱动完成重分配）
+lspci -vvv -s "$GPU" | grep -A8 'Physical Resizable BAR'
+nvidia-smi -q | grep -A2 'BAR1 Memory'      # 期望 Total : 8192 MiB
+
+# Linux 侧两个 ReBAR 前置（install-efi.sh 已自动幂等写入，下面是手工核查命令）
+grep -h '^options nvidia' /etc/modprobe.d/nvidia-rebar.conf   # ① NVreg_EnableResizableBar=1
+grep 'pci=realloc' /etc/default/grub                          # ② 内核命令行参数
+# 手工改过 /etc/default/grub 后必须重跑 install-efi.sh 重新烘焙 UNLOCK 条目，
+# 单独 update-grub 对已烘焙的内核行无效。
+```
+
+版本确认：开机进 booter 时屏幕（或 `BOOTER_TRACE.TXT`）应出现
+`Core loaded below 2 GiB: 40hx core v29.69 (inspect+rebar)`；看不到 = ESP 里仍是旧产物，用 `--build` 重装。
 
 ---
 

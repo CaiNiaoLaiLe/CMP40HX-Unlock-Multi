@@ -1,0 +1,106 @@
+CMP40HX Unlock / UEFI proof of concept
+Target: NVIDIA 10de:1f0b / 10de:220d. Default mode is read-only inspect.
+
+GPU 0000:05:00.0 ID=1f0b10de
+Upstream bridge 0000:00:03.0
+BAR0=0xfa000000 BAR1=0x383ff0000000
+BOOT0=0x166000a1
+Core loaded below 2 GiB: 40hx core v29.69 (inspect+rebar)
+
+== booter (DIRECT_SEC2) ==
+[core] 
+=== DIRECT_SEC2 compute unlock (v70 [6]-[10]) ===
+[core] booter: [6][7] prepare host buffers
+[core] 
+=== prep: host buffers (v70 [6]-[7]) ===
+[core] prep: v67 @0x110000000 (0xfa00 B, >4G)
+[core] prep: ucode @0x111010000 (0xe700 B) sig@+0x8700=67436032
+[core] prep: bl @0x11201f000 (0x6000 B)
+[core] prep: dummy fw 27MB @0x113025000 (ELF sz=0x1bfadc8)
+[core] prep: radix-3 @0x115c20000 (nData=7163 nL2=14, data@+0x10000)
+[core] prep: meta @0x11882b000 wpr=1f7700000:1fff00000 heap=1f7800000 fb=200000000
+[core] prep: fwsec @0x11982c000 (0x9df0 B, 40HX native)
+[core] prep: DONE meta=0x11882b000 ucode=0x111010000 fwsec=0x11982c000
+[core] booter: [pre] reading pre-reset WPR2/SS0...
+[core] booter: [pre] WPR2 hi=00000000 lo=1ffffe00 SS0=00000000
+[core] booter: [pre] normalize SBR (clear stale WPR2/SEC2 state)
+[core] SBR via 0000:00:03.0; settling 3 seconds
+[core] SBR device ready: 1f0b10de
+[core] booter: [8] gsp_engine_reset
+[core] gsp: ENGINE reset (stop GFW from POST)
+[core] booter: [8b] fwsec_boot_gsp_40hx (WPR2 latch)
+[core] 
+=== 40HX FWSEC HS-boot on GSP (blob 0x9a00+0x3f0) ===
+[core] fwsec40: kflcnReset(GSP)...
+[core] fwsec40: GSP reset cpuctl=00000010 bcr=00000000 hwcfg2=000007f7
+[core] fwsec40: iface hdr={1,4,8,2} mapper sig=50414d44 ver=20545 cmd_in_off=3b0 size=40
+[core] fwsec40: mapper.init_cmd=15 frts4k=1ffe00 (frts=1ffe00000)
+[core] fwsec40: FBIF bit7 + TRANSCFG0/4=5 DMACTL=0
+[core] fwsec40: BL DESC ctxDma=4 code=11982c000 (ns400@0 sec9600@0x400) data=119835a00(3f0)
+[core] fwsec40: BL IMEM top hwcfg.IMEM=256 dst=fe00 (BOOTVEC=fd00)  <== WARN dst!=0xfd00
+[core] fwsec40: rb IMEM[fe00]=004000d0 (exp BL[0]=004000d0)  <== OK
+[core] fwsec40: rb DMEM[0x20]=00000004 (exp ctxDma 4)
+[core] fwsec40: STARTCPU (BL@0xfd00 -> DMA FWSEC), poll WPR2 up 5s...
+[core] fwsec40: *** WPR2 UP lo=01ffe000 hi=01ffee00 after 0 ms ***
+[core] booter: fwsec -> 0; WPR2 hi=01ffee00 lo=01ffe000
+[core] booter: [9] booter_load_tu102_direct
+[core] 
+=== tu102_direct: BOOT_DIRECT port loader ===
+[core] tu102 pre: hwcfg2=000007f7
+[core] tu102 pre: cpuctl=00000010
+[core] tu102 pre: dmatrf=00000002
+[core] tu102 pre: wpr2 hi=01ffee00 lo=01ffe000
+[core] tu102: raise WPR2 lo=01ffe000 hi=01ffee00
+[core] tu102: WPR2 rb hi=01ffee00 lo=01ffe000
+[core] tu102: read reset_plm...
+[core] tu102: reset_plm=000000ff (cmpunlocker exp 0xff)
+[core] 
+--- tu102 attempt 1/2: no-reset (driver-style) ---
+[core] tu102: cpuctl=00000010 halted=1
+[core] tu102: port load IMEM ns+sec + DMEM
+[core] tu102: rb IMEM[0]=ce100049(exp ce100049) IMEM_S=dead5ec1 DMEM[0x200]=67436032(exp sig 67436032)
+[core] tu102: BOOTVEC=0 mbox0=1882b000 mbox1=00000001 STARTCPU
+[core] tu102: started; hold 3s WITHOUT reg reads (v57 lesson)
+[core] tu102: read#1 cpu...
+[core] tu102:   cpu=00000010
+[core] tu102: read#2 irq...
+[core] tu102:   irq=00000010
+[core] tu102: read#3 dbg...
+[core] tu102:   dbg=deadb00d
+[core] tu102: read#4 mbox...
+[core] tu102:   m0=00000000 m1=00000001
+[core] tu102 RESULT: PLM=ffffff8f SS0=88888888 SS1=00000008 WPR2=00000000:1ffffe00
+[core] tu102: *** mbox0=0 -> booter OK (attempt 1) ***
+[core] booter: load_tu102_direct -> 0
+[core] booter: [10] read PLM...
+[core] booter: [10] read SS0...
+[core] booter: [10] read SS1...
+[core] booter: RESULT PLM=ffffff8f SS0=88888888 SS1=00000008 WPR2=00000000:1ffffe00
+[core] booter: *** UNLOCKED (SS0=0x88888888 SS1=0x8) ***
+
+== gen2 ==
+gen2 policy: OVR=00000006 CFG=80085800 PL=00340036 MISC=20342d00 CYA=068711b3
+gen2 gpu  policy CAP=00453d02 CAP2=00000006 CTL=0000 CTL2=0002 STA=1101 spd=1
+gen2 root pre    CAP=077a3903 CAP2=0000000e CTL=0042 CTL2=0001 STA=7101 spd=1
+gen2: retrain round 1, CCC=0 on both ends
+gen2 gpu  tgt    CAP=00453d02 CAP2=00000006 CTL=0000 CTL2=0022 STA=1101 spd=1
+gen2 root tgt    CAP=077a3903 CAP2=0000000e CTL=0200 CTL2=0022 STA=3101 spd=1
+gen2 gpu  done   CAP=00453d02 CAP2=00000006 CTL=0000 CTL2=0022 STA=1101 spd=1
+gen2 root done   CAP=077a3903 CAP2=0000000e CTL=0200 CTL2=0022 STA=3101 spd=1
+gen2: retrain round 2, CCC=1 on both ends
+gen2 gpu  tgt    CAP=00453d02 CAP2=00000006 CTL=0040 CTL2=0022 STA=1102 spd=2
+gen2 root tgt    CAP=077a3903 CAP2=0000000e CTL=0240 CTL2=0022 STA=3102 spd=2
+gen2 gpu  done   CAP=00453d02 CAP2=00000006 CTL=0040 CTL2=0022 STA=1102 spd=2
+gen2 root done   CAP=077a3903 CAP2=0000000e CTL=0240 CTL2=0022 STA=3102 spd=2
+gen2: link trained at Gen2 during the UEFI stage.
+
+== rebar ==
+[core] rebar before: CYA=00000006 CFG=80000000 CAP=00000400 CTL=00000601
+[core] rebar after:  CYA=0000000d CFG=80000007 CAP=0003fc00 CTL=00000d01
+[core] rebar: XVE aperture unlocked to 8 GiB; OS resize follows
+rebar complete
+
+UNLOCK SEQUENCE COMPLETED.
+Boot Linux without powering off.
+
+Press any key to continue booting PVE/Linux (auto in 5s)...
